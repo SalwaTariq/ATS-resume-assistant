@@ -18,9 +18,9 @@ from pypdf import PdfReader
 # Configuration
 # ----------------------------------------------------------------------------
 DEFAULT_MODEL = "gemini-3.8-flash"  # override with the GEMINI_MODEL secret/env var
-FALLBACK_MODEL = "gemini-3.5-flash"  # backup(s), comma-separated, via GEMINI_FALLBACK_MODEL
+FALLBACK_MODEL = "gemini-3.5-flash,gemini-3.5-flash-lite"  # backups, comma-separated (GEMINI_FALLBACK_MODEL)
 RETRIES_PER_MODEL = 3  # tries per model before moving on
-RETRY_WAIT_SECONDS = 2  # doubles after each failed try (2s, 4s)
+RETRY_WAIT_SECONDS = 3  # doubles after each failed try (3s, 6s)
 MAX_FILE_MB = 5
 MAX_CHARS = 30_000  # keeps the prompt small and fast
 MIN_CHARS = 200  # below this, the file is probably scanned/empty
@@ -183,6 +183,11 @@ def normalize_result(data: dict) -> dict:
 def _is_busy_error(exc: Exception) -> bool:
     msg = str(exc)
     return any(c in msg for c in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "504", "DEADLINE"))
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    msg = str(exc)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg
 
 
 def _is_model_missing(exc: Exception) -> bool:
@@ -412,12 +417,24 @@ def main() -> None:
                 )
         except Exception as exc:
             msg = str(exc)
-            if _is_busy_error(exc):
+            if _is_rate_limit(exc):
                 st.error(
-                    "Google's AI is very busy right now. The app already retried "
-                    "and tried a backup model. Please wait a minute and click "
-                    "Analyze again."
+                    "You've hit Google's usage limit for this API key (too many "
+                    "requests, or the free daily quota is used up). Wait a few "
+                    "minutes and try again. If it keeps happening, check your "
+                    "usage at https://aistudio.google.com or create a key in a "
+                    "different project."
                 )
+                with st.expander("Technical details"):
+                    st.code(msg[:800])
+            elif _is_busy_error(exc):
+                st.error(
+                    "Google's AI servers are overloaded right now. The app already "
+                    "retried and tried backup models. Please wait a few minutes "
+                    "and click Analyze again."
+                )
+                with st.expander("Technical details"):
+                    st.code(msg[:800])
             elif "401" in msg or "UNAUTHENTICATED" in msg or "API key" in msg:
                 st.error(
                     "Google rejected the API key. Create a fresh key at "
