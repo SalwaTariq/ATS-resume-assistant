@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -17,6 +18,9 @@ from pypdf import PdfReader
 # Configuration
 # ----------------------------------------------------------------------------
 DEFAULT_MODEL = "gemini-3.5-flash"  # override with the GEMINI_MODEL secret/env var
+FALLBACK_MODEL = "gemini-2.5-flash"  # used if the main model is busy/unavailable
+RETRIES_PER_MODEL = 3  # tries per model before moving on
+RETRY_WAIT_SECONDS = 2  # doubles after each failed try (2s, 4s)
 MAX_FILE_MB = 5
 MAX_CHARS = 30_000  # keeps the prompt small and fast
 MIN_CHARS = 200  # below this, the file is probably scanned/empty
@@ -176,24 +180,61 @@ def normalize_result(data: dict) -> dict:
     }
 
 
-def analyze_resume(resume_text: str, job_description: str, api_key: str, model: str) -> dict:
+def _is_busy_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(c in msg for c in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL", "504", "DEADLINE"))
+
+
+def _is_model_missing(exc: Exception) -> bool:
+    msg = str(exc)
+    return "404" in msg or "NOT_FOUND" in msg
+
+
+def analyze_resume(
+    resume_text: str,
+    job_description: str,
+    api_key: str,
+    model: str,
+    fallback_model: str = FALLBACK_MODEL,
+) -> dict:
+    """Call Gemini; retry when it is busy and fall back to a second model."""
     # Imported here so the rest of the module works without the SDK installed.
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+    prompt = build_prompt(resume_text, job_description)
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        response_mime_type="application/json",
     )
-    text = getattr(response, "text", None)
-    if not text:
-        raise ValueError("The AI returned an empty response (it may have been blocked). Try again.")
-    return normalize_result(parse_model_json(text))
+
+    models = [model]
+    if fallback_model and fallback_model != model:
+        models.append(fallback_model)
+
+    last_exc = None
+    for m in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(
+                    model=m, contents=prompt, config=config
+                )
+                text = getattr(response, "text", None)
+                if not text:
+                    raise ValueError(
+                        "The AI returned an empty response (it may have been blocked). Try again."
+                    )
+                return normalize_result(parse_model_json(text))
+            except Exception as exc:
+                last_exc = exc
+                if _is_model_missing(exc):
+                    break  # this model name doesn't exist -> try the next one
+                if not _is_busy_error(exc):
+                    raise  # bad key, bad request, etc. -> retrying won't help
+                if attempt < RETRIES_PER_MODEL - 1:
+                    time.sleep(RETRY_WAIT_SECONDS * (2**attempt))
+    raise last_exc
 
 
 # ----------------------------------------------------------------------------
@@ -330,12 +371,6 @@ def main() -> None:
         if not api_key:
             st.error("Please enter your Gemini API key in the sidebar.")
             return
-        if not api_key.startswith("AIza"):
-            st.warning(
-                "This key doesn't start with 'AIza', which is what Google AI Studio "
-                "keys usually look like. If the next step fails, create a new key at "
-                "https://aistudio.google.com/apikey and try again."
-            )
 
         data = uploaded.getvalue()
         if len(data) > MAX_FILE_MB * 1024 * 1024:
@@ -359,10 +394,22 @@ def main() -> None:
 
         try:
             with st.spinner("Analyzing with Gemini..."):
-                result = analyze_resume(text, job_description, api_key, model)
+                result = analyze_resume(
+                    text,
+                    job_description,
+                    api_key,
+                    model,
+                    get_secret("GEMINI_FALLBACK_MODEL", FALLBACK_MODEL).strip(),
+                )
         except Exception as exc:
             msg = str(exc)
-            if "401" in msg or "UNAUTHENTICATED" in msg or "API key" in msg:
+            if _is_busy_error(exc):
+                st.error(
+                    "Google's AI is very busy right now. The app already retried "
+                    "and tried a backup model. Please wait a minute and click "
+                    "Analyze again."
+                )
+            elif "401" in msg or "UNAUTHENTICATED" in msg or "API key" in msg:
                 st.error(
                     "Google rejected the API key. Create a fresh key at "
                     "https://aistudio.google.com/apikey and paste only the key "
