@@ -17,8 +17,8 @@ from pypdf import PdfReader
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-3.5-flash"  # override with the GEMINI_MODEL secret/env var
-FALLBACK_MODEL = "gemini-2.5-flash"  # used if the main model is busy/unavailable
+DEFAULT_MODEL = "gemini-3.8-flash"  # override with the GEMINI_MODEL secret/env var
+FALLBACK_MODEL = "gemini-3.5-flash"  # backup(s), comma-separated, via GEMINI_FALLBACK_MODEL
 RETRIES_PER_MODEL = 3  # tries per model before moving on
 RETRY_WAIT_SECONDS = 2  # doubles after each failed try (2s, 4s)
 MAX_FILE_MB = 5
@@ -195,9 +195,12 @@ def analyze_resume(
     job_description: str,
     api_key: str,
     model: str,
-    fallback_model: str = FALLBACK_MODEL,
+    fallback_models=FALLBACK_MODEL,
 ) -> dict:
-    """Call Gemini; retry when it is busy and fall back to a second model."""
+    """Call Gemini; retry when it is busy and fall back to backup model(s).
+
+    fallback_models can be one model name or several separated by commas.
+    """
     # Imported here so the rest of the module works without the SDK installed.
     from google import genai
     from google.genai import types
@@ -209,10 +212,15 @@ def analyze_resume(
         response_mime_type="application/json",
     )
 
+    if isinstance(fallback_models, str):
+        fallback_models = fallback_models.split(",")
     models = [model]
-    if fallback_model and fallback_model != model:
-        models.append(fallback_model)
+    for m in fallback_models or []:
+        m = m.strip()
+        if m and m not in models:
+            models.append(m)
 
+    busy_exc = None  # remembered so the user sees "busy", not a misleading 404
     last_exc = None
     for m in models:
         for attempt in range(RETRIES_PER_MODEL):
@@ -229,12 +237,13 @@ def analyze_resume(
             except Exception as exc:
                 last_exc = exc
                 if _is_model_missing(exc):
-                    break  # this model name doesn't exist -> try the next one
+                    break  # this model name isn't available -> try the next one
                 if not _is_busy_error(exc):
                     raise  # bad key, bad request, etc. -> retrying won't help
+                busy_exc = exc
                 if attempt < RETRIES_PER_MODEL - 1:
                     time.sleep(RETRY_WAIT_SECONDS * (2**attempt))
-    raise last_exc
+    raise busy_exc or last_exc
 
 
 # ----------------------------------------------------------------------------
