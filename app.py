@@ -331,12 +331,11 @@ def main() -> None:
             st.error("Please enter your Gemini API key in the sidebar.")
             return
         if not api_key.startswith("AIza"):
-            st.error(
-                "This doesn't look like a Gemini API key (they start with 'AIza'). "
-                "Create one at https://aistudio.google.com/apikey - not an OAuth "
-                "client secret or Google Cloud token."
+            st.warning(
+                "This key doesn't start with 'AIza', which is what Google AI Studio "
+                "keys usually look like. If the next step fails, create a new key at "
+                "https://aistudio.google.com/apikey and try again."
             )
-            return
 
         data = uploaded.getvalue()
         if len(data) > MAX_FILE_MB * 1024 * 1024:
